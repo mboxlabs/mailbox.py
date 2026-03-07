@@ -5,9 +5,27 @@ from .message import OutgoingMail, MailMessage, MailboxStatus, FetchOptions
 from .provider import MailboxProvider, Subscription, AckableMessage
 from .error import ProviderNotFound
 
+import asyncio
+...
 class Mailbox:
     def __init__(self):
         self.providers: Dict[str, MailboxProvider] = {}
+
+    async def start(self) -> None:
+        """
+        Starts all registered providers.
+        """
+        providers = list(self.providers.values())
+        if providers:
+            await asyncio.gather(*(p.init() for p in providers))
+
+    async def stop(self) -> None:
+        """
+        Stops all registered providers and releases resources.
+        """
+        providers = list(self.providers.values())
+        if providers:
+            await asyncio.gather(*(p.close() for p in providers))
 
     def register_provider(self, provider: MailboxProvider) -> None:
         self.providers[provider.protocol] = provider

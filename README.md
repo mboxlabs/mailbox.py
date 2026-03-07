@@ -72,7 +72,10 @@ async def main():
     mailbox = Mailbox()
     mailbox.register_provider(MemoryProvider())
 
-    # 2. Subscribe to an address and define message handler
+    # 2. Start the mailbox (initializes providers)
+    await mailbox.start()
+
+    # 3. Subscribe to an address and define message handler
     async def on_receive(message):
         print(f"Received message! From: {message.from_}")
         print(f"Content: {message.body}")
@@ -84,14 +87,18 @@ async def main():
 
     print("Mailbox established, listening on 'mem:service@example.com/inbox'...")
 
-    # 3. Send a message to that address
+    # 4. Send a message to that address
     await mailbox.post(OutgoingMail(
         from_="mem:client@example.com/user-1",
         to="mem:service@example.com/inbox",
         body={"text": "Hello, Mailbox!"}
     ))
 
-    # Give async tasks time to complete
+    # 5. Clean up: Unsubscribe and stop the mailbox (releases resources)
+    await subscription.unsubscribe()
+    await mailbox.stop()
+
+    # Give async tasks time to complete (if needed)
     await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
@@ -182,6 +189,14 @@ from mailbox import MailboxProvider, MailMessage, MailboxStatus, FetchOptions
 class MyCustomProvider(MailboxProvider):
     def __init__(self):
         super().__init__("myprotocol")
+
+    async def init(self) -> None:
+        # Optional: Initialize connections, pre-warm caches
+        pass
+
+    async def _close(self) -> None:
+        # Optional: Specific closing logic, release resources
+        pass
 
     async def _send(self, message: MailMessage) -> None:
         # Implement sending logic

@@ -7,6 +7,29 @@ class TestMailbox(unittest.IsolatedAsyncioTestCase):
         self.mailbox = Mailbox()
         self.provider = MemoryProvider()
         self.mailbox.register_provider(self.provider)
+        await self.mailbox.start()
+
+    async def asyncTearDown(self):
+        await self.mailbox.stop()
+
+    async def test_stop_cleanup(self):
+        address = "mem:test/stop"
+        received_msgs = []
+
+        async def on_receive(msg):
+            received_msgs.append(msg)
+
+        sub = await self.mailbox.subscribe(address, on_receive)
+        
+        # Stop mailbox
+        await self.mailbox.stop()
+
+        # Send message after stop
+        mail = OutgoingMail(from_="mem:sender", to=address, body="after stop")
+        await self.mailbox.post(mail)
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(len(received_msgs), 0)
 
     async def test_send_and_subscribe(self):
         address = "mem:test/inbox"
