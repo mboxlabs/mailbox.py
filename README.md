@@ -58,14 +58,15 @@ pip install mboxlabs-mailbox
 pip install -r requirements-dev.txt
 
 # Run tests
-python -m pytest tests/
+export PYTHONPATH=$(pwd)/python
+pytest python/mboxlabs/mailbox/tests/
 ```
 
 ### Basic Example
 
 ```python
 import asyncio
-from mailbox import Mailbox, MemoryProvider, OutgoingMail
+from mboxlabs.mailbox import Mailbox, MemoryProvider, OutgoingMail
 
 async def main():
     # 1. Create mailbox instance and register a memory provider
@@ -143,7 +144,7 @@ await subscription.unsubscribe()
 
 **Auto-acknowledgment:**
 ```python
-from mailbox import FetchOptions
+from mboxlabs.mailbox import FetchOptions
 
 msg = await mailbox.fetch(
     "mem:service/inbox",
@@ -176,6 +177,24 @@ print(f"State: {status.state}")
 print(f"Unread: {status.unread_count}")
 ```
 
+### 4. Accessing Providers
+
+You can gracefully access registered providers via the `providers` property or `get_provider` method:
+
+```python
+# Get all providers (returns a copy of the mapping)
+all_providers = mailbox.providers
+if "mem" in all_providers:
+    print("Memory provider is registered")
+
+# Get a specific provider
+# protocol can be "mem" or "mem:"
+provider = mailbox.get_provider("mem")
+
+# Get provider or raise error if not found
+provider = mailbox.get_provider("slack", raise_error_if_failed=True)
+```
+
 ## 🏗️ Architecture
 
 ### Provider Interface
@@ -184,7 +203,7 @@ Implement the `MailboxProvider` abstract class to create custom providers:
 
 ```python
 from abc import ABC, abstractmethod
-from mailbox import MailboxProvider, MailMessage, MailboxStatus, FetchOptions
+from mboxlabs.mailbox import MailboxProvider, MailMessage, MailboxStatus, FetchOptions
 
 class MyCustomProvider(MailboxProvider):
     def __init__(self):
@@ -230,12 +249,12 @@ class MyCustomProvider(MailboxProvider):
 
 ## 🧪 Testing
 
-Run the test suite:
+Run the test suite from the package root directory. **Note: You must set `PYTHONPATH` to include the `python` directory so the `mboxlabs` module can be found.**
 
 ```bash
-cd packages/mailbox
-export PYTHONPATH=$PYTHONPATH:$(pwd)/python
-python3 -m unittest discover -s python/mailbox/tests -p "test_*.py"
+# Set PYTHONPATH and run tests
+export PYTHONPATH=$(pwd)/python
+pytest python/mboxlabs/mailbox/tests/test_mailbox.py
 ```
 
 Tests include:
@@ -248,7 +267,7 @@ Tests include:
 ## 📚 Project Structure
 
 ```
-python/mailbox/
+python/mboxlabs/mailbox/
 ├── __init__.py           # Package exports
 ├── core.py               # Main Mailbox class
 ├── message.py            # Message data structures

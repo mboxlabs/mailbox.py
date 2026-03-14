@@ -43,5 +43,5 @@ Documentation = "https://github.com/mboxlabs/mailbox.py"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mailbox*"]
-exclude = ["tests*"]
+include = ["mboxlabs*"]
+exclude = ["mboxlabs.mailbox.tests*"]

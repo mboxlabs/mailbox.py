@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from mailbox import Mailbox, MemoryProvider, OutgoingMail, FetchOptions, MailboxStatus
+from mboxlabs.mailbox import Mailbox, MemoryProvider, OutgoingMail, FetchOptions, MailboxStatus
 
 class TestMailbox(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -142,6 +142,24 @@ class TestMailbox(unittest.IsolatedAsyncioTestCase):
         status = await self.mailbox.status(address)
         self.assertEqual(status.unread_count, 1)
         self.assertEqual(status.state, "online")
+
+    def test_provider_access(self):
+        # Test providers property
+        providers = self.mailbox.providers
+        self.assertIn("mem", providers)
+        self.assertEqual(providers["mem"], self.provider)
+
+        # Test get_provider with and without colon
+        self.assertEqual(self.mailbox.get_provider("mem"), self.provider)
+        self.assertEqual(self.mailbox.get_provider("mem:"), self.provider)
+
+        # Test get_provider without raise_error
+        self.assertIsNone(self.mailbox.get_provider("unknown"))
+
+        # Test get_provider with raise_error
+        from mboxlabs.mailbox.error import ProviderNotFound
+        with self.assertRaises(ProviderNotFound):
+            self.mailbox.get_provider("unknown", raise_error_if_failed=True)
 
 if __name__ == '__main__':
     unittest.main()

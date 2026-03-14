@@ -9,13 +9,37 @@ import asyncio
 ...
 class Mailbox:
     def __init__(self):
-        self.providers: Dict[str, MailboxProvider] = {}
+        self._providers: Dict[str, MailboxProvider] = {}
+
+    @property
+    def providers(self) -> Dict[str, MailboxProvider]:
+        """
+        Returns a copy of all registered providers.
+        """
+        return self._providers.copy()
+
+    def get_provider(self, protocol: str, raise_error_if_failed: bool = False) -> Optional[MailboxProvider]:
+        """
+        Returns the provider for the specified protocol.
+
+        :param protocol: The protocol name (e.g., "mem" or "mem:").
+        :param raise_error_if_failed: If True, raises ProviderNotFound if the provider is not found.
+        """
+        key = protocol
+        if protocol.endswith(':'):
+            key = protocol[:-1]
+
+        if key not in self._providers:
+            if raise_error_if_failed:
+                raise ProviderNotFound(key)
+            return None
+        return self._providers[key]
 
     async def start(self) -> None:
         """
         Starts all registered providers.
         """
-        providers = list(self.providers.values())
+        providers = list(self._providers.values())
         if providers:
             await asyncio.gather(*(p.init() for p in providers))
 
@@ -23,29 +47,16 @@ class Mailbox:
         """
         Stops all registered providers and releases resources.
         """
-        providers = list(self.providers.values())
+        providers = list(self._providers.values())
         if providers:
             await asyncio.gather(*(p.close() for p in providers))
 
     def register_provider(self, provider: MailboxProvider) -> None:
-        self.providers[provider.protocol] = provider
-
-    def _get_provider(self, protocol: str) -> MailboxProvider:
-        # Protocol usually comes with ':', so we might need to strip it if the map keys don't have it.
-        # In TS, it does `protocol.slice(0, -1)`.
-        # Here, we assume the provider.protocol returns "mem" (without colon).
-        # And the URL protocol is "mem:".
-        key = protocol
-        if protocol.endswith(':'):
-            key = protocol[:-1]
-
-        if key not in self.providers:
-            raise ProviderNotFound(key)
-        return self.providers[key]
+        self._providers[provider.protocol] = provider
 
     async def post(self, mail: OutgoingMail) -> MailMessage:
         parsed_to = urlparse(mail.to)
-        provider = self._get_provider(parsed_to.scheme)
+        provider = self.get_provider(parsed_to.scheme, raise_error_if_failed=True)
 
         message_id = mail.id if mail.id else provider.generate_id()
 
@@ -55,15 +66,15 @@ class Mailbox:
 
     async def subscribe(self, address: str, on_receive: callable) -> Subscription:
         parsed_address = urlparse(address)
-        provider = self._get_provider(parsed_address.scheme)
+        provider = self.get_provider(parsed_address.scheme, raise_error_if_failed=True)
         return await provider.subscribe(address, on_receive)
 
     async def fetch(self, address: str, options: FetchOptions) -> Union[MailMessage, AckableMessage, None]:
         parsed_address = urlparse(address)
-        provider = self._get_provider(parsed_address.scheme)
+        provider = self.get_provider(parsed_address.scheme, raise_error_if_failed=True)
         return await provider.fetch(address, options)
 
     async def status(self, address: str) -> MailboxStatus:
         parsed_address = urlparse(address)
-        provider = self._get_provider(parsed_address.scheme)
+        provider = self.get_provider(parsed_address.scheme, raise_error_if_failed=True)
         return await provider.status(address)
