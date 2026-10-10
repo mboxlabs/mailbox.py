@@ -128,7 +128,18 @@ A mailbox address consists of three parts:
 
 ## 🎯 Core Features
 
-### 1. Subscribe Pattern (Push)
+There are two ways to receive mail, and one message goes to **one of them only**, decided
+when `post()` runs:
+
+| State of the address when `post()` runs | Where the message goes |
+|------|------|
+| at least one active subscriber | handed to every subscriber's callback; **not** queued, so `fetch()` gets nothing |
+| no subscriber | queued; `fetch()` gets it, subscribers get nothing |
+
+Mutually exclusive per message: a message already handed to a subscriber can never be
+fetched, and a queued message is never replayed to a subscriber that appears later.
+
+### 1. Subscribe
 
 ```python
 subscription = await mailbox.subscribe(
@@ -140,7 +151,20 @@ subscription = await mailbox.subscribe(
 await subscription.unsubscribe()
 ```
 
-### 2. Fetch Pattern (Pull)
+If the callback raises, the error decides the message's fate: retriable errors
+(`is_retriable = True`, or `code` in `503 / 504 / ECONNRESET / ETIMEDOUT`) put the message
+back in the queue, where `fetch()` can pick it up; anything else is dropped, so one bad
+message is not retried forever.
+
+```python
+class UpstreamDown(Exception):
+    is_retriable = True
+
+async def handler(msg):
+    raise UpstreamDown("upstream down")   # → 回到队列，计入 unread_count
+```
+
+### 2. Fetch
 
 **Auto-acknowledgment:**
 ```python
@@ -169,13 +193,28 @@ if ackable:
     # Or: await ackable.nack(requeue=True)  # Negative ack with requeue
 ```
 
+`ack_timeout` 的三态语义（与 TS / Rust 端一致）：
+
+| 传值 | 含义 |
+|------|------|
+| `None`（缺省） | 用 `DEFAULT_ACK_TIMEOUT`（30 秒），未 ack 的消息会重新入队 |
+| 正数 | 该超时（秒） |
+| `0` | 关闭 stale 扫描，消息常驻 in-flight 直到 ack/nack |
+
+不传 ≠ 永不超时：否则崩溃的消费者会把消息永久卡在 in-flight。
+
 ### 3. Status Query
 
 ```python
 status = await mailbox.status("mem:service/inbox")
 print(f"State: {status.state}")
-print(f"Unread: {status.unread_count}")
+print(f"Unread: {status.unread_count}")        # 仍在队列里等待
+print(f"In flight: {status.in_flight_count}")  # 已取出、尚未 ack/nack
+print(f"Subscribers: {status.extra['subscriber_count']}")
 ```
+
+`unread_count` 只统计队列里等待的消息；用 `manual_ack=True` 取出的消息单独计入
+`in_flight_count`，一直不 ack 会回到队列。
 
 ### 4. Accessing Providers
 
@@ -195,6 +234,37 @@ provider = mailbox.get_provider("mem")
 provider = mailbox.get_provider("slack", raise_error_if_failed=True)
 ```
 
+### 5. Subscriber Failures and Retry (opt-in)
+
+What a subscriber callback raises decides where the message goes: a retriable error
+(`is_retriable = True`, or `code` in `503 / 504 / ECONNRESET / ETIMEDOUT`) requeues the
+message so `fetch()` can pick it up; anything else is dropped, so one bad message is not
+retried forever.
+
+By default nothing calls the callback again. Opt into automatic redelivery per provider:
+
+```python
+from mboxlabs.mailbox import MemoryProvider, RetryPolicy
+
+provider = MemoryProvider(RetryPolicy(max_attempts=3, base_delay=1.0))  # seconds
+mailbox.register_provider(provider)
+```
+
+Only the failing subscriber is re-invoked — subscribing is a broadcast, and re-broadcasting
+would run the side effects of the subscribers that already succeeded a second time. Attempts
+are counted per (subscriber, message); when the budget runs out the message goes back to the
+queue, and unsubscribing while a retry is pending returns it to the queue as well. A message
+is never queued twice: `requeue()` skips one that is already queued or in flight.
+
+Retry is opt-in because AMQP / SQS style transports already redeliver and ship dead-letter
+queues; retrying on top of them would double-deliver. `provider.set_retry_policy(None)`
+returns to the default behaviour, and a provider subclass can override
+`_on_retry_exhausted(message, attempts)` to dead-letter or alert.
+
+The policy pieces are importable on their own (`mboxlabs.mailbox.retry`: `RetryPolicy`,
+`resolve_retry_policy`, `is_retriable_error`, `next_retry_delay`, `AttemptLedger`) so other
+packages can reuse the same retriable check and backoff instead of writing their own.
+
 ## 🏗️ Architecture
 
 ### Provider Interface
@@ -203,11 +273,14 @@ Implement the `MailboxProvider` abstract class to create custom providers:
 
 ```python
 from abc import ABC, abstractmethod
-from mboxlabs.mailbox import MailboxProvider, MailMessage, MailboxStatus, FetchOptions
+from typing import Optional
+from mboxlabs.mailbox import (
+    MailboxProvider, MailMessage, MailboxStatus, FetchOptions, RetryPolicy
+)
 
 class MyCustomProvider(MailboxProvider):
-    def __init__(self):
-        super().__init__("myprotocol")
+    def __init__(self, retry: Optional[RetryPolicy] = None):  # retry is opt-in
+        super().__init__("myprotocol", retry)
 
     async def init(self) -> None:
         # Optional: Initialize connections, pre-warm caches
@@ -237,6 +310,16 @@ class MyCustomProvider(MailboxProvider):
     async def _status(self, address: str) -> MailboxStatus:
         # Implement status query logic
         pass
+
+    async def _nack(self, message: MailMessage, requeue: bool) -> None:
+        # Optional: called when a subscriber callback fails. Implement it if your transport
+        # can put the message back; otherwise a retriable failure is simply lost.
+        pass
+
+    def _on_retry_exhausted(self, message: MailMessage, attempts: int) -> None:
+        # Optional: dead-letter or alert once the retry budget is spent. The message still
+        # goes back to the queue afterwards.
+        pass
 ```
 
 ### Built-in Providers
@@ -244,7 +327,9 @@ class MyCustomProvider(MailboxProvider):
 - **MemoryProvider**: In-memory message bus for local communication
   - Topic-based routing
   - FIFO queue with manual/auto acknowledgment
-  - Stale message requeueing
+  - Stale message requeueing, with requeue deduplication (a message is never queued twice)
+  - Opt-in subscription retry (`RetryPolicy`); by default a failed subscriber only requeues
+    the message and nothing re-invokes the callback
   - Thread-safe singleton event bus
 
 ## 🧪 Testing
@@ -262,7 +347,17 @@ Tests include:
 - Fetch with auto-ack
 - Fetch with manual-ack
 - Nack with requeue
-- Status queries
+- Status queries, including in-flight visibility
+- Subscribe and fetch are mutually exclusive per message
+- Requeue deduplication and the retry policy helpers
+- Opt-in subscription retry: targeted redelivery, exhausted budget falls back to the queue
+
+Run them with either of:
+
+```bash
+python3 -m pytest -q          # from the python/ directory
+pytest python/mboxlabs/mailbox/tests/test_mailbox.py   # from the package root, with PYTHONPATH set
+```
 
 ## 📚 Project Structure
 
@@ -273,6 +368,7 @@ python/mboxlabs/mailbox/
 ├── message.py            # Message data structures
 ├── provider.py           # Abstract provider base class
 ├── error.py              # Exception definitions
+├── retry.py              # Retry policy, backoff and attempt accounting
 ├── utils.py              # Utility functions
 ├── providers/
 │   ├── memory.py         # In-memory provider

@@ -64,6 +64,9 @@ pip install --upgrade build twine
 在项目根目录（包含 pyproject.toml 的目录）运行：
 
 ```bash
+# 发布前先跑测试（覆盖投递语义、in-flight 可见性、回队去重与订阅重试）
+python3 -m pytest -q
+
 # 清理旧的构建文件
 rm -rf dist/ build/ *.egg-info
 

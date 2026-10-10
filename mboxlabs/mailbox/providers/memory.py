@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from ..provider import MailboxProvider, AckableMessage, OnReceiveCallback
 from ..message import MailMessage, MailboxStatus, FetchOptions
+from ..retry import RetryPolicy
 from ..utils import get_canonical_mailbox_address_identifier
 from .queue import MailMessageQueue
 
@@ -38,17 +39,19 @@ class MemoryEventBus:
     async def publish(self, topic: str, message: MailMessage) -> None:
         self.last_activity[topic] = datetime.now(timezone.utc).isoformat()
 
-        # Push to subscribers
-        if topic in self.topics:
-            for listener in self.topics[topic]:
-                # Execute listener (fire and forget or await?)
-                # In Rust/TS it's async. Here we await it to ensure order or spawn task?
-                # TS: listeners.forEach(listener => listener(message)); -> fire and forget if async?
-                # Rust: tokio::spawn -> fire and forget
-                # Python: asyncio.create_task -> fire and forget
+        # 交给订阅者
+        listeners = self.topics.get(topic)
+        if listeners:
+            for listener in listeners:
+                # Python: asyncio.create_task -> fire and forget (同 TS/Rust 端)
                 asyncio.create_task(listener(message))
+            # 已交给订阅者的消息不再入队（与 TS 端一致）：两条路都走时，
+            # 订阅者从不 fetch → 队列只涨不消；退订后一次 fetch 又会把
+            # 已处理的消息再投递一遍。一个 topic 的投递方式只能选一种。
+            # 注意这里必须判空列表：退订后 topics[topic] 仍存在但是空列表。
+            return
 
-        # Enqueue for pull consumers
+        # 入队，等待 fetch 取回
         self.queue.enqueue(topic, message)
 
     def fetch_and_forget(self, topic: str) -> Optional[MailMessage]:
@@ -68,18 +71,27 @@ class MemoryEventBus:
         # But here we just support the queue operation.
         self.queue.nack(message_id, requeue)
 
+    def requeue(self, topic: str, message: MailMessage) -> None:
+        """不经 in-flight 直接把消息放回队列头部。用于订阅者可重试失败。"""
+        self.last_activity[topic] = datetime.now(timezone.utc).isoformat()
+        self.queue.requeue(topic, message)
+
     def get_status(self, topic: str) -> Dict[str, Any]:
-        unread_count = self.queue.get_status(topic)
+        queue_status = self.queue.get_status(topic)
         subscriber_count = len(self.topics.get(topic, []))
         return {
-            'unread_count': unread_count,
+            'unread_count': queue_status['unread_count'],
+            'in_flight_count': queue_status['in_flight_count'],
             'last_activity_time': self.last_activity.get(topic),
             'subscriber_count': subscriber_count
         }
 
 class MemoryProvider(MailboxProvider):
-    def __init__(self):
-        super().__init__("mem")
+    def __init__(self, retry: Optional[RetryPolicy] = None):
+        """
+        :param retry: 可选的订阅重试策略。不传则保持默认：订阅失败只把消息退回队列，不自动重投。
+        """
+        super().__init__("mem", retry)
         self.bus = MemoryEventBus.get_instance()
 
     async def _send(self, message: MailMessage) -> None:
@@ -121,6 +133,19 @@ class MemoryProvider(MailboxProvider):
         return MailboxStatus(
             state="online",
             unread_count=status_info['unread_count'],
+            in_flight_count=status_info['in_flight_count'],
             last_activity_time=status_info['last_activity_time'],
             extra={'subscriber_count': status_info['subscriber_count']}
         )
+
+    async def _nack(self, message: MailMessage, requeue: bool) -> None:
+        """订阅模式下 on_receive 抛错时，provider.py 会带可重试判定结果调到这里。
+
+        之前 MemoryProvider 没有实现：订阅的消息不再入队后，可重试错误等于消息静默消失。
+        requeue=True 将消息退回 topic 队列头部（可被 fetch 取回、在 unread_count 可见）；
+        requeue=False（非可重试）按死信处理直接丢弃。
+        """
+        if not requeue:
+            return
+        topic = get_canonical_mailbox_address_identifier(message.to)
+        self.bus.requeue(topic, message)

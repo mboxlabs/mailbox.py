@@ -43,6 +43,9 @@ class MailboxStatus:
     """
     state: str
     unread_count: Optional[int] = None
+    # Messages handed to a consumer but not yet ack'd/nack'd. Kept separate from
+    # unread_count so stuck in-flight messages are not invisible in status.
+    in_flight_count: Optional[int] = None
     last_activity_time: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -52,4 +55,6 @@ class FetchOptions:
     Options for fetching messages.
     """
     manual_ack: bool = False
-    ack_timeout: Optional[float] = None  # Seconds
+    # Seconds. None -> DEFAULT_ACK_TIMEOUT; 0 -> disable the stale check entirely
+    # (the message stays in-flight until it is ack'd or nack'd).
+    ack_timeout: Optional[float] = None
