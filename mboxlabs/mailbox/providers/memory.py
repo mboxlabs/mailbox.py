@@ -1,18 +1,24 @@
-from typing import Dict, List, Any, Optional, Union, Callable, Awaitable
-import asyncio
+from typing import Dict, List, Any, Optional, Union, Callable
 from datetime import datetime, timezone
 
-from ..provider import MailboxProvider, AckableMessage, OnReceiveCallback
+from ..provider import MailboxProvider, AckableMessage, DeliveryListener
 from ..message import MailMessage, MailboxStatus, FetchOptions
 from ..retry import RetryPolicy
 from ..utils import get_canonical_mailbox_address_identifier
 from .queue import MailMessageQueue
 
+
+async def _rethrow(error: BaseException):
+    """把同步抛出的错误延后到被等待时再抛，交给 barrier 的 gather 归一处理。"""
+    raise error
+
+
 class MemoryEventBus:
     _instance = None
 
     def __init__(self):
-        self.topics: Dict[str, List[OnReceiveCallback]] = {}
+        # 监听器 = 基类的投递入口：返回本次投递的最终结算（awaitable）
+        self.topics: Dict[str, List[DeliveryListener]] = {}
         self.queue: MailMessageQueue[MailMessage] = MailMessageQueue()
         self.last_activity: Dict[str, str] = {}
 
@@ -22,7 +28,7 @@ class MemoryEventBus:
             cls._instance = MemoryEventBus()
         return cls._instance
 
-    def subscribe(self, topic: str, listener: OnReceiveCallback) -> Callable[[], None]:
+    def subscribe(self, topic: str, listener: DeliveryListener) -> Callable[[], None]:
         if topic not in self.topics:
             self.topics[topic] = []
         self.topics[topic].append(listener)
@@ -36,23 +42,37 @@ class MemoryEventBus:
                     pass
         return unsubscribe
 
-    async def publish(self, topic: str, message: MailMessage) -> None:
+    def publish(self, topic: str, message: MailMessage) -> Optional[List[Any]]:
+        """
+        发布一条消息：有订阅者时交给订阅回调，否则入队等待 fetch 取回。
+
+        :return: 广播时返回每次投递的结算 awaitable（供发送侧做结算判定，见 `_send`）；
+            入队时返回 `None`。注意广播仍是 fire-and-forget：这里不等待，`post()` 也不会
+            等订阅回调跑完。
+        """
         self.last_activity[topic] = datetime.now(timezone.utc).isoformat()
 
         # 交给订阅者
         listeners = self.topics.get(topic)
         if listeners:
-            for listener in listeners:
-                # Python: asyncio.create_task -> fire and forget (同 TS/Rust 端)
-                asyncio.create_task(listener(message))
-            # 已交给订阅者的消息不再入队（与 TS 端一致）：两条路都走时，
-            # 订阅者从不 fetch → 队列只涨不消；退订后一次 fetch 又会把
+            # 一条消息只走一条路：有订阅者就只走订阅。
+            # 两条路都走时，订阅者从不 fetch → 队列只涨不消；退订后一次 fetch 又会把
             # 已处理的消息再投递一遍。一个 topic 的投递方式只能选一种。
             # 注意这里必须判空列表：退订后 topics[topic] 仍存在但是空列表。
-            return
+            #
+            # 每次投递的结算要留一份给发送侧：部分失败时「整条消息回不回队」
+            # 必须等全部投递结算后才能判断，不能由先失败的那个订阅者说了算。
+            deliveries = []
+            for listener in listeners:
+                try:
+                    deliveries.append(listener(message))
+                except Exception as error:  # 监听器同步抛错：归一成失败结算，不能打断 publish
+                    deliveries.append(_rethrow(error))
+            return deliveries
 
         # 入队，等待 fetch 取回
         self.queue.enqueue(topic, message)
+        return None
 
     def fetch_and_forget(self, topic: str) -> Optional[MailMessage]:
         self.last_activity[topic] = datetime.now(timezone.utc).isoformat()
@@ -87,6 +107,10 @@ class MemoryEventBus:
         }
 
 class MemoryProvider(MailboxProvider):
+    #: 订阅是广播：一条消息对每个订阅者各投递一次。失败处理因此走投递级记账，
+    #: 整条消息回不回队由 `_send` 里的结算 barrier 决定。
+    broadcast_deliveries = True
+
     def __init__(self, retry: Optional[RetryPolicy] = None):
         """
         :param retry: 可选的订阅重试策略。不传则保持默认：订阅失败只把消息退回队列，不自动重投。
@@ -95,10 +119,17 @@ class MemoryProvider(MailboxProvider):
         self.bus = MemoryEventBus.get_instance()
 
     async def _send(self, message: MailMessage) -> None:
+        """
+        发送并给广播挂上结算 barrier：等这条消息的全部投递（含重试链）落定后，才决定要不要
+        把它退回队列（判定在 `should_requeue_after_broadcast`）。
+        """
         topic = get_canonical_mailbox_address_identifier(message.to)
-        await self.bus.publish(topic, message)
+        deliveries = self.bus.publish(topic, message)
+        if deliveries is None:
+            return  # 没有订阅者：消息入队，由 fetch / ack 那套语义负责
+        self._track_broadcast_settlement(message, deliveries)
 
-    async def _subscribe(self, address: str, on_receive: OnReceiveCallback) -> Any:
+    async def _subscribe(self, address: str, on_receive: DeliveryListener) -> Any:
         topic = get_canonical_mailbox_address_identifier(address)
         return self.bus.subscribe(topic, on_receive)
 
@@ -139,11 +170,11 @@ class MemoryProvider(MailboxProvider):
         )
 
     async def _nack(self, message: MailMessage, requeue: bool) -> None:
-        """订阅模式下 on_receive 抛错时，provider.py 会带可重试判定结果调到这里。
+        """订阅模式下广播结算后的处置入口（由 `_send` 的 barrier 调用一次，不在每个订阅者失败时调用）。
 
-        之前 MemoryProvider 没有实现：订阅的消息不再入队后，可重试错误等于消息静默消失。
-        requeue=True 将消息退回 topic 队列头部（可被 fetch 取回、在 unread_count 可见）；
-        requeue=False（非可重试）按死信处理直接丢弃。
+        不实现的话，订阅的消息不再入队后可重试错误等于消息静默消失。
+        requeue=True（全部投递都失败）将消息退回 topic 队列头部（可被 fetch 取回、在
+        unread_count 里可见）；requeue=False（有订阅者成功，或失败不可重试）按死信处理直接丢弃。
         """
         if not requeue:
             return

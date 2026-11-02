@@ -16,6 +16,8 @@ from mboxlabs.mailbox import (
 )
 from mboxlabs.mailbox.message import MailMessage
 from mboxlabs.mailbox.providers.queue import MailMessageQueue
+from mboxlabs.mailbox.tests.helpers import TransientError
+
 
 class TestMailbox(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -228,9 +230,6 @@ class TestMemoryDeliverySemantics(unittest.IsolatedAsyncioTestCase):
     async def test_retriable_subscriber_failure_returns_to_queue(self):
         address = "mem:py-bus/retriable-failure"
 
-        class TransientError(Exception):
-            is_retriable = True
-
         async def on_receive(msg):
             raise TransientError("temporary outage")
 
@@ -393,9 +392,6 @@ class TestSubscriptionRetry(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_failing_subscribers_leave_one_copy(self):
         address = "mem:py-bus/dedup-multi-sub"
 
-        class TransientError(Exception):
-            is_retriable = True
-
         async def failing(msg):
             raise TransientError("outage")
 
@@ -423,9 +419,6 @@ class TestSubscriptionRetry(unittest.IsolatedAsyncioTestCase):
         await mailbox.start()
 
         state = {"healthy": 0, "flaky": 0}
-
-        class TransientError(Exception):
-            is_retriable = True
 
         async def healthy(msg):
             state["healthy"] += 1
@@ -456,9 +449,6 @@ class TestSubscriptionRetry(unittest.IsolatedAsyncioTestCase):
         await mailbox.start()
 
         calls = {"n": 0}
-
-        class TransientError(Exception):
-            is_retriable = True
 
         async def failing(msg):
             calls["n"] += 1
@@ -510,9 +500,6 @@ class TestSubscriptionRetry(unittest.IsolatedAsyncioTestCase):
         await mailbox.start()
 
         calls = {"n": 0}
-
-        class TransientError(Exception):
-            is_retriable = True
 
         async def failing(msg):
             calls["n"] += 1

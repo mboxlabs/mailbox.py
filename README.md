@@ -151,8 +151,8 @@ subscription = await mailbox.subscribe(
 await subscription.unsubscribe()
 ```
 
-If the callback raises, the error decides the message's fate: retriable errors
-(`is_retriable = True`, or `code` in `503 / 504 / ECONNRESET / ETIMEDOUT`) put the message
+If the callback raises, the error decides the message's fate: a retriable error
+(`is_retriable = True`, or `code` in `503 / 504 / ECONNRESET / ETIMEDOUT`) puts the message
 back in the queue, where `fetch()` can pick it up; anything else is dropped, so one bad
 message is not retried forever.
 
@@ -163,6 +163,21 @@ class UpstreamDown(Exception):
 async def handler(msg):
     raise UpstreamDown("upstream down")   # → 回到队列，计入 unread_count
 ```
+
+One address can have several subscribers, and subscribing is a **broadcast**: one message
+becomes one _delivery_ per subscriber, and each delivery settles on its own
+(`delivery_id = subscription_id + message_id`). That decides what happens when subscribers
+disagree — A succeeds, B throws a retriable error:
+
+| 广播结果              | 邮箱的处理                                                          |
+| --------------------- | ------------------------------------------------------------------- |
+| 有投递成功            | 消息已处理——**不**回队；失败的投递交给 `_on_delivery_deadlettered` |
+| 全部失败且可重试      | 消息退回队列头部，由 `fetch()` 取回（只有一份）                     |
+| 全部失败且不可重试    | 直接丢弃，避免一条坏消息被无限重试                                  |
+
+把“已经有人处理过”的消息退回队列，等于让 `fetch()` 消费者把同一段副作用再跑一遍——所以部分
+失败按投递结算，不整条回队。结算发生在全部投递（含重试链）落定之后：`post()` 只等派发、不等
+结算，因此 `post()` 之后立刻读 `status()` 看不出结果。
 
 ### 2. Fetch
 
@@ -250,20 +265,72 @@ provider = MemoryProvider(RetryPolicy(max_attempts=3, base_delay=1.0))  # second
 mailbox.register_provider(provider)
 ```
 
-Only the failing subscriber is re-invoked — subscribing is a broadcast, and re-broadcasting
-would run the side effects of the subscribers that already succeeded a second time. Attempts
-are counted per (subscriber, message); when the budget runs out the message goes back to the
-queue, and unsubscribing while a retry is pending returns it to the queue as well. A message
-is never queued twice: `requeue()` skips one that is already queued or in flight.
+|                  | 默认（不传 `retry`）          | 传入策略                        |
+| ---------------- | ----------------------------- | ------------------------------- |
+| 可重试失败       | 回队一次，由 `fetch()` 取回   | 按指数退避重新调用回调          |
+| 尝试次数         | 1                             | `max_attempts`（含首次）        |
+| 次数耗尽         | —                             | 没有任何投递成功时回队          |
+
+Three rules keep this from duplicating work:
+
+- **Only the failing subscriber is re-invoked** — subscribing is a broadcast, and re-broadcasting
+  would run the side effects of the subscribers that already succeeded a second time.
+- **A message is never queued twice** — `requeue()` skips one that is already queued or in flight,
+  so N failing subscribers leave exactly one copy in the queue.
+- **A handled message is never requeued** — if any delivery of the broadcast succeeded, the failing
+  ones are dead-lettered (`_on_delivery_deadlettered`) instead of putting the whole message back;
+  requeue is reserved for "every subscriber failed".
+
+Attempts are counted per (subscriber, message); when the budget runs out the delivery settles as
+`retriable`, and unsubscribing while a retry is pending settles it as `cancelled`.
 
 Retry is opt-in because AMQP / SQS style transports already redeliver and ship dead-letter
 queues; retrying on top of them would double-deliver. `provider.set_retry_policy(None)`
-returns to the default behaviour, and a provider subclass can override
-`_on_retry_exhausted(message, attempts)` to dead-letter or alert.
+returns to the default behaviour, a provider subclass can override
+`_on_retry_exhausted(message, attempts)` to alert once the budget is spent, and
+`_on_delivery_deadlettered(message, failed_deliveries)` to persist the failed deliveries that
+will **not** be requeued.
 
 The policy pieces are importable on their own (`mboxlabs.mailbox.retry`: `RetryPolicy`,
 `resolve_retry_policy`, `is_retriable_error`, `next_retry_delay`, `AttemptLedger`) so other
-packages can reuse the same retriable check and backoff instead of writing their own.
+packages can reuse the same retriable check and backoff instead of writing their own. So is the
+delivery bookkeeping (`mboxlabs.mailbox.delivery`: `DeliveryResult`, `delivery_key`,
+`should_requeue_after_broadcast`, `to_delivery_results`).
+
+### 6. Settlement Safety Nets (timeouts, races, provider contracts)
+
+A broadcast is only settled once **every** delivery of it settles — that is what makes the
+per-delivery requeue rule above work, and it is also where the hazards hide. Three safety nets,
+same as the TypeScript side:
+
+- **A stuck callback cannot make a message invisible.** Every delivery _attempt_ is watched by
+  `provider.delivery_settle_timeout` (default `DEFAULT_DELIVERY_SETTLE_TIMEOUT` = 30 seconds).
+  When it fires the attempt settles as `cancelled`: the message falls back to `fetch()` (or the
+  dead-letter hook) and a warning is printed. The watchdog covers one attempt only — a backoff
+  wait is never counted — so it cannot cut a healthy retry chain short. Setting
+  `provider.delivery_settle_timeout = 0` opts out: you then own the lifecycle.
+- **`unsubscribe()` and `stop()` never prejudge a running callback.** Only deliveries sitting in a
+  retry backoff are cancelled. A callback that is still running settles on its own; declaring it
+  failed would make the broadcast look like "nobody succeeded" and hand the same side effect to a
+  `fetch()` consumer a second time.
+- **Concurrent deliveries of the same `id` settle independently.** `post(OutgoingMail(id=...))`
+  accepts caller-supplied ids, so two in-flight deliveries to one subscriber never share
+  settlement bookkeeping. Dedup still applies where it belongs: a message already queued or in
+  flight is never queued twice.
+
+If you implement your own **broadcast** provider (`broadcast_deliveries = True`), `_send` must
+attach the settlement barrier — synchronously, before any `await`:
+
+```python
+async def _send(self, message: MailMessage) -> None:
+    deliveries = self.bus.publish(topic, message)  # one awaitable per delivery
+    self._track_broadcast_settlement(message, deliveries)
+```
+
+A provider that forgets it does not lose messages silently: the base class falls back to a
+whole-message requeue and warns you. Producer-style providers that build a message themselves and
+hand it to a local subscriber must use `_deliver_to_local_subscription(subscription_id, message)`,
+otherwise that delivery is never accounted for.
 
 ## 🏗️ Architecture
 
@@ -291,12 +358,19 @@ class MyCustomProvider(MailboxProvider):
         pass
 
     async def _send(self, message: MailMessage) -> None:
-        # Implement sending logic
+        # Implement sending logic. A *broadcasting* provider (one that hands the message to
+        # several subscribers) must also attach the settlement barrier, synchronously and
+        # before any await:
+        #     deliveries = self.bus.publish(topic, message)   # one awaitable per delivery
+        #     self._track_broadcast_settlement(message, deliveries)
+        # `post()` never waits for the deliveries; the barrier decides, once they have all
+        # settled, whether the message goes back to the queue.
         pass
 
     async def _subscribe(self, address: str, on_receive) -> Any:
-        # Implement subscription logic
-        # Return an unsubscribe handle
+        # Implement subscription logic.
+        # `on_receive(message)` returns the delivery's final settlement (awaitable of
+        # DeliveryResult); return an unsubscribe handle.
         pass
 
     async def _unsubscribe(self, subscription_id: str, handle: Any) -> None:
@@ -308,19 +382,37 @@ class MyCustomProvider(MailboxProvider):
         pass
 
     async def _status(self, address: str) -> MailboxStatus:
-        # Implement status query logic
+        # Optional: status query logic. Not implementing it reports state='unknown'.
         pass
 
     async def _nack(self, message: MailMessage, requeue: bool) -> None:
-        # Optional: called when a subscriber callback fails. Implement it if your transport
-        # can put the message back; otherwise a retriable failure is simply lost.
+        # Optional: for broadcast providers this is called ONCE per broadcast, after every
+        # delivery settled (the barrier decides `requeue`); it is not called once per failing
+        # subscriber. Implement it if your transport can put the message back.
         pass
 
     def _on_retry_exhausted(self, message: MailMessage, attempts: int) -> None:
-        # Optional: dead-letter or alert once the retry budget is spent. The message still
-        # goes back to the queue afterwards.
+        # Optional: alert or persist once the retry budget is spent. If nobody handled the
+        # message it still goes back to the queue afterwards.
+        pass
+
+    def _on_delivery_deadlettered(self, message: MailMessage, failed) -> None:
+        # Optional: a delivery failed and the message will NOT be requeued (partial failure,
+        # or every failure fatal). `failed` is a list of DeliveryResult. Without this hook
+        # those deliveries are simply invisible.
         pass
 ```
+
+Two switches on the base class are worth knowing:
+
+| 开关 | 默认 | 作用 |
+| ---- | ---- | ---- |
+| `broadcast_deliveries` | `False` | `True`：`subscribe` 是广播（一条消息 = N 次投递），失败按投递结算，整条消息回不回队交给 barrier；`False`：每次投递对应 broker 的一次 ack，保持 per-delivery `nack` |
+| `delivery_settle_timeout` | `DEFAULT_DELIVERY_SETTLE_TIMEOUT`（30 秒） | 单次尝试的结算看门狗；`0` 关闭 |
+
+Producer-style providers that build a message themselves and hand it to a local subscriber must
+use `_deliver_to_local_subscription(subscription_id, message)` instead of calling the callback
+directly — that is where the delivery gets accounted for (implicit ack, retries, settlement).
 
 ### Built-in Providers
 
@@ -328,9 +420,12 @@ class MyCustomProvider(MailboxProvider):
   - Topic-based routing
   - FIFO queue with manual/auto acknowledgment
   - Stale message requeueing, with requeue deduplication (a message is never queued twice)
+  - Per-delivery settlement: `broadcast_deliveries = True`, `_send` attaches the barrier, so a
+    partial failure never requeues a message somebody already handled
   - Opt-in subscription retry (`RetryPolicy`); by default a failed subscriber only requeues
     the message and nothing re-invokes the callback
-  - Thread-safe singleton event bus
+  - Singleton event bus shared by every `MemoryProvider` in the process (use distinct addresses
+    between tests)
 
 ## 🧪 Testing
 
@@ -351,6 +446,12 @@ Tests include:
 - Subscribe and fetch are mutually exclusive per message
 - Requeue deduplication and the retry policy helpers
 - Opt-in subscription retry: targeted redelivery, exhausted budget falls back to the queue
+- Per-delivery settlement: partial failure is not requeued, all-fail still requeues (one copy),
+  the dead-letter hook sees what was dropped
+- Settlement safety nets: a running callback is never prejudged, a missing barrier falls back to
+  a whole-message requeue (plus a warning), concurrent deliveries of the same `id` settle
+  independently, the settle watchdog bounds stuck callbacks without cutting retry chains short,
+  and producer-style deliveries are accounted for
 
 Run them with either of:
 
@@ -366,7 +467,8 @@ python/mboxlabs/mailbox/
 ├── __init__.py           # Package exports
 ├── core.py               # Main Mailbox class
 ├── message.py            # Message data structures
-├── provider.py           # Abstract provider base class
+├── provider.py           # Abstract provider base class (delivery accounting, retry, barrier)
+├── delivery.py           # DeliveryResult, delivery identity and the requeue decision
 ├── error.py              # Exception definitions
 ├── retry.py              # Retry policy, backoff and attempt accounting
 ├── utils.py              # Utility functions
@@ -374,7 +476,11 @@ python/mboxlabs/mailbox/
 │   ├── memory.py         # In-memory provider
 │   └── queue.py          # Generic message queue
 └── tests/
-    └── test_mailbox.py   # Test suite
+    ├── helpers.py                    # 唯一 topic、日志屏蔽、共用订阅者桩
+    ├── test_mailbox.py               # 基础语义
+    ├── test_delivery.py              # 投递记账工具
+    ├── test_subscribe_partial_failure.py  # 部分失败不回队（issue#2）
+    └── test_delivery_settlement.py   # 结算竞态与兜底
 ```
 
 ## 🔧 Dependencies

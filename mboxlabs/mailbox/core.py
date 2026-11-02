@@ -6,7 +6,8 @@ from .provider import MailboxProvider, Subscription, AckableMessage
 from .error import ProviderNotFound
 
 import asyncio
-...
+
+
 class Mailbox:
     def __init__(self):
         self._providers: Dict[str, MailboxProvider] = {}
