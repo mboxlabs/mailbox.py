@@ -332,6 +332,54 @@ whole-message requeue and warns you. Producer-style providers that build a messa
 hand it to a local subscriber must use `_deliver_to_local_subscription(subscription_id, message)`,
 otherwise that delivery is never accounted for.
 
+### 7. Instance isolation and state reset (`mem:` provider)
+
+`MemoryProvider` simulates a broker on an in-memory event bus. By default every `MemoryProvider`
+shares one process-wide bus, so all `Mailbox` instances in the process see the same `mem:` queues
+and subscription tables, and that state outlives `stop()`. This is intentional — it is what lets
+two `Mailbox` instances talk to each other — but it means you have to choose the boundary
+explicitly when you want independence (host + plugin, kernel + provider, or tests that must not
+leak into each other):
+
+```python
+# 1. Private bus — no one else in the process can see its queues or subscriptions.
+isolated = MemoryProvider.create_isolated()
+
+# 2. Named namespace — shared within a scope, invisible across scopes.
+tenant = MemoryProvider.for_scope("tenant-a")
+
+# 3. Bring your own bus — e.g. two Mailboxes that are meant to share one "server".
+shared = MemoryProvider(bus=MemoryEventBus())
+```
+
+Reset state without tearing subscriptions down:
+
+```python
+await mailbox.clear()                    # drop every provider's backlog (queued + in-flight)
+await mailbox.stop(purge=True)           # close subscriptions, then drop the backlog
+provider.bus.clear("inbox@example.com")  # one topic only; returns how many messages were dropped
+```
+
+The topic handed to `MemoryEventBus.clear()` is the canonical identifier (the address with its
+`mem:` scheme stripped off), because that is the key the bus files the queue under.
+
+Caveats worth knowing:
+
+- `clear()` drops messages, never subscriptions. Closing a channel is `unsubscribe()` /
+  `Mailbox.stop()`'s job — a `Subscription` left `active` while nothing is ever delivered to it is
+  worse than a visible backlog.
+- `stop()` never deletes messages either: a provider that is closed and started again still sees the
+  backlog left behind. Use `stop(purge=True)` to drop it.
+- On the default bus, `clear()` clears the whole `mem:` namespace of the process — that is what a
+  shared "server" means. Use `create_isolated()` / `for_scope()` when that is not what you want.
+- One provider instance must not be registered on two Mailboxes: subscriptions live on the provider,
+  so `stop()` on one unsubscribes the other. The library warns once when it sees this.
+- The scope registry is never garbage-collected: a scope name generated per run (timestamp, random
+  id) pins its bus for the lifetime of the process. Use `create_isolated()` for throwaway state.
+- `MailboxProvider.clear()` is a **no-op by default**: purging a real broker (AMQP / SQS / IMAP) is
+  a destructive operation and its messages do not live in this process, so the base class does not
+  decide it for its subclasses. Providers that own their storage override it.
+
 ## 🏗️ Architecture
 
 ### Provider Interface
@@ -424,8 +472,12 @@ directly — that is where the delivery gets accounted for (implicit ack, retrie
     partial failure never requeues a message somebody already handled
   - Opt-in subscription retry (`RetryPolicy`); by default a failed subscriber only requeues
     the message and nothing re-invokes the callback
-  - Singleton event bus shared by every `MemoryProvider` in the process (use distinct addresses
-    between tests)
+  - Instance boundaries: the default constructor shares the process-wide bus (cross-`Mailbox`
+    messaging, and the backlog surviving `stop()`); `create_isolated()` gives a provider a private
+    bus, `for_scope(name)` a namespace, and the constructor takes `bus=` for anything custom
+  - Purgeable: `MailMessageQueue.clear()` / `MemoryEventBus.clear(topic=None)` / `MemoryProvider.clear()`
+    / `Mailbox.clear()` / `Mailbox.stop(purge=True)` drop queued **and** in-flight messages and
+    report how many were dropped; a late `ack()` / `nack(requeue)` on a dropped message is a no-op
 
 ## 🧪 Testing
 
@@ -452,6 +504,10 @@ Tests include:
   a whole-message requeue (plus a warning), concurrent deliveries of the same `id` settle
   independently, the settle watchdog bounds stuck callbacks without cutting retry chains short,
   and producer-style deliveries are accounted for
+- Instance isolation and state reset: the shared default bus keeps working, `create_isolated()` /
+  `for_scope()` / `bus=` do not leak into each other, the `clear()` chain (queue → bus → provider →
+  mailbox) drops queued and in-flight messages without touching subscriptions, `stop(purge=True)`
+  closes then purges, and reusing one provider instance across Mailboxes warns once
 
 Run them with either of:
 
@@ -477,10 +533,11 @@ python/mboxlabs/mailbox/
 │   └── queue.py          # Generic message queue
 └── tests/
     ├── helpers.py                    # 唯一 topic、日志屏蔽、共用订阅者桩
-    ├── test_mailbox.py               # 基础语义
+    ├── test_mailbox.py               # 基础语义（含队列 clear）
     ├── test_delivery.py              # 投递记账工具
     ├── test_subscribe_partial_failure.py  # 部分失败不回队（issue#2）
-    └── test_delivery_settlement.py   # 结算竞态与兜底
+    ├── test_delivery_settlement.py   # 结算竞态与兜底
+    └── test_memory_isolation.py      # 实例边界与状态清理（issue#3）
 ```
 
 ## 🔧 Dependencies

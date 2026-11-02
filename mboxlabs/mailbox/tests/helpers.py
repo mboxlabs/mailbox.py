@@ -10,7 +10,10 @@ _counter = itertools.count(1)
 
 
 def addr_of(name: str) -> str:
-    """MemoryEventBus 是进程级单例：每个用例必须用唯一 topic。"""
+    """默认总线是进程级共享的：用默认 provider 的用例必须用唯一 topic。
+
+    需要真隔离时用 `MemoryProvider.create_isolated()`（issue#3），见 `test_memory_isolation.py`。
+    """
     return "mem:py{}-{}@bus/inbox".format(next(_counter), name)
 
 
@@ -35,9 +38,12 @@ def failing():
 
 
 def reset_bus():
-    """清掉进程级单例总线里的 topic 状态（每个用例独立）。"""
-    bus = MemoryEventBus.get_instance()
-    bus.topics.clear()
-    bus.queue.queues.clear()
-    bus.queue.in_flight.clear()
-    bus.last_activity.clear()
+    """清掉进程级单例总线里的积压消息（含 in-flight）与活动时间。
+
+    issue#3 之后走公开的 `MemoryEventBus.clear()`：以前这里直接掏私有字段
+    （`bus.queue.queues` / `bus.queue.in_flight`），队列结构一改测试就碎。
+
+    订阅表**不**清：`clear()` 不拆订阅是有意语义（否则旧 `Subscription` 会变成“报 active
+    但再也收不到消息”的僵尸）。用例之间不串台靠 `addr_of()` 的唯一 topic。
+    """
+    MemoryEventBus.get_instance().clear()

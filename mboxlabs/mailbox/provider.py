@@ -140,6 +140,9 @@ class MailboxProvider(ABC):
         """
         Closes the provider and releases resources.
         This method automatically cancels all active subscriptions.
+
+        注意：`close()` **不**清消息队列——“关掉通道”不等于“销毁在途数据”。要一并清掉积压消息
+        用 `Mailbox.stop(purge=True)` 或 `MailboxProvider.clear()`。
         """
         # 1. Clean up all active subscriptions
         if self._subscriptions:
@@ -175,6 +178,16 @@ class MailboxProvider(ABC):
         Subclass responsibility: Implement specific closing logic here.
         """
         pass
+
+    async def clear(self) -> None:
+        """
+        丢弃本 provider 持有的积压消息（含 in-flight），不动订阅。
+
+        默认**空实现**：“清空传输”对 AMQP / SQS / IMAP 这类真实 broker 是破坏性运维操作，
+        消息也不在本地，基类不能替子类下结论。需要 purge 语义的 provider（如
+        `MemoryProvider`）自己覆写。
+        """
+        # 默认无可清理内容：传输型 provider 的消息存在 broker 里，不在本地。
 
     def generate_id(self) -> str:
         return str(uuid.uuid4())

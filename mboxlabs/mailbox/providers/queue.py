@@ -119,6 +119,35 @@ class MailMessageQueue(Generic[T]):
                     return True
         return False
 
+    def clear(self, topic: Optional[str] = None) -> int:
+        """
+        清空队列状态：不传 `topic` 则清空所有 topic。
+
+        in-flight 的消息**也**会被丢弃：它同样是队列状态的一部分，只清「等待中」的那一半，
+        下一轮（或同进程的另一个消费者 / 另一个测试用例）还是会看到残留消息。
+        被丢弃的 in-flight 消息之后 `ack()` / `nack(requeue)` 都是 no-op —— 不会复活成幽灵消息。
+
+        :param topic: 只清这个 topic；省略则清空全部。
+        :return: 被丢弃的消息数（含 in-flight），便于诊断与断言。
+        """
+        if topic is None:
+            dropped = len(self.in_flight)
+            for queued in self.queues.values():
+                dropped += len(queued)
+            self.queues.clear()
+            self.in_flight.clear()
+            return dropped
+
+        dropped = 0
+        queued = self.queues.pop(topic, None)
+        if queued:
+            dropped += len(queued)
+        for msg_id, flight in list(self.in_flight.items()):
+            if flight.topic == topic:
+                del self.in_flight[msg_id]
+                dropped += 1
+        return dropped
+
     def requeue_stale(self, topic: str, timeout: float) -> None:
         now = time.time()
         stale_ids = []

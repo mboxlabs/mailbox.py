@@ -181,7 +181,9 @@ class TestMailbox(unittest.IsolatedAsyncioTestCase):
 class TestMemoryDeliverySemantics(unittest.IsolatedAsyncioTestCase):
     """订阅与取回二选一、订阅失败不静默丢失、in-flight 可见（与 TS 端对齐）。
 
-    MemoryEventBus 是进程内单例，topic 跨 Mailbox 实例共享，所以地址必须用独立前缀。
+    这里用的是默认构造的 provider（共享进程级 bus），topic 跨 Mailbox 实例可见，
+    所以地址仍必须用独立前缀。需要真隔离的用例见 `test_memory_isolation.py`
+    （`MemoryProvider.create_isolated()`）。
     """
 
     async def asyncSetUp(self):
@@ -376,6 +378,65 @@ class TestQueueRequeueDedup(unittest.TestCase):
         queue.nack("again-1", True)
         self.assertEqual(queue.get_status("topic")["unread_count"], 1)
         self.assertTrue(queue.has("again-1"))
+
+
+class TestQueueClear(unittest.TestCase):
+    """issue#3：队列状态必须能被清掉，否则同进程的多个 Mailbox / 多个用例互相串台。"""
+
+    def test_clear_one_topic_reports_how_many_messages_were_dropped(self):
+        queue = MailMessageQueue()
+        one = MailMessage(id="q-1", from_="a", to="b", body=1)
+        two = MailMessage(id="q-2", from_="a", to="b", body=2)
+        queue.enqueue("topic1", one)
+        queue.enqueue("topic1", two)
+        queue.enqueue("topic2", two)
+
+        self.assertEqual(queue.clear("topic1"), 2)
+
+        self.assertEqual(queue.get_status("topic1"), {"unread_count": 0, "in_flight_count": 0})
+        self.assertEqual(queue.get_status("topic2")["unread_count"], 1)
+        self.assertEqual(queue.dequeue("topic2").id, two.id)
+
+    def test_clear_drops_in_flight_too_and_it_cannot_come_back(self):
+        # in-flight 也是队列状态的一部分：只清「等待中」的那半，用例跑完还是会看到残留消息。
+        queue = MailMessageQueue()
+        message = MailMessage(id="clear-inflight-1", from_="a", to="b", body=1)
+        queue.enqueue("topic1", message)
+        queue.dequeue_for_ack("topic1", None, lambda m: m.id)
+        self.assertEqual(queue.get_status("topic1"), {"unread_count": 0, "in_flight_count": 1})
+
+        self.assertEqual(queue.clear("topic1"), 1)
+        self.assertEqual(queue.get_status("topic1"), {"unread_count": 0, "in_flight_count": 0})
+        self.assertFalse(queue.has(message.id))
+
+        # 迟到的 ack / nack 不能再把已清理的消息放回队列（否则会“复活”成幽灵消息）。
+        queue.ack(message.id)
+        queue.nack(message.id, True)
+        self.assertEqual(queue.get_status("topic1"), {"unread_count": 0, "in_flight_count": 0})
+
+    def test_clear_without_topic_drops_every_topic(self):
+        queue = MailMessageQueue()
+        queue.enqueue("topic1", MailMessage(id="q-1", from_="a", to="b", body=1))
+        queue.enqueue("topic2", MailMessage(id="q-2", from_="a", to="b", body=2))
+        queue.dequeue_for_ack("topic2", None, lambda m: m.id)
+
+        self.assertEqual(queue.clear(), 2)  # topic1 的 1 条 + topic2 的 1 条 in-flight
+        self.assertEqual(queue.get_status("topic1"), {"unread_count": 0, "in_flight_count": 0})
+        self.assertEqual(queue.get_status("topic2"), {"unread_count": 0, "in_flight_count": 0})
+
+    def test_clear_is_idempotent_and_safe_on_an_unknown_topic(self):
+        queue = MailMessageQueue()
+        message = MailMessage(id="q-1", from_="a", to="b", body=1)
+        queue.enqueue("topic1", message)
+
+        self.assertEqual(queue.clear("topic1"), 1)
+        self.assertEqual(queue.clear("topic1"), 0)
+        self.assertEqual(queue.clear("never-seen"), 0)
+        self.assertEqual(queue.clear(), 0)
+
+        # 清空后队列还能照常使用
+        queue.enqueue("topic1", message)
+        self.assertEqual(queue.dequeue("topic1").id, message.id)
 
 
 class TestSubscriptionRetry(unittest.IsolatedAsyncioTestCase):

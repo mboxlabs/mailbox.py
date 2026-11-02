@@ -2,8 +2,8 @@ from .core import Mailbox
 from .message import OutgoingMail, MailMessage, MailboxStatus, FetchOptions
 from .provider import MailboxProvider, Subscription, AckableMessage
 from .error import MailboxError, ProviderNotFound, InvalidAddress
-from .providers.memory import MemoryProvider
-from .providers.queue import DEFAULT_ACK_TIMEOUT
+from .providers.memory import DEFAULT_MEMORY_SCOPE, MemoryEventBus, MemoryProvider
+from .providers.queue import DEFAULT_ACK_TIMEOUT, MailMessageQueue
 from .delivery import (
     DEFAULT_DELIVERY_SETTLE_TIMEOUT,
     DeliveryResult,
@@ -25,6 +25,7 @@ __all__ = [
     'Mailbox',
     'DEFAULT_ACK_TIMEOUT',
     'DEFAULT_DELIVERY_SETTLE_TIMEOUT',
+    'DEFAULT_MEMORY_SCOPE',
     'AttemptLedger',
     'RetryPolicy',
     'is_retriable_error',
@@ -46,5 +47,7 @@ __all__ = [
     'MailboxError',
     'ProviderNotFound',
     'InvalidAddress',
+    'MailMessageQueue',
+    'MemoryEventBus',
     'MemoryProvider',
 ]
