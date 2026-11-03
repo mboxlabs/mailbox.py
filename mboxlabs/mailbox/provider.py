@@ -18,7 +18,9 @@ from .delivery import (
     to_delivery_results,
 )
 from .message import MailMessage, MailboxStatus, FetchOptions
+from .error import InvalidFetchOptionsError, UnsupportedCapabilityError
 from .retry import AttemptLedger, RetryPolicy, is_retriable_error, next_retry_delay, resolve_retry_policy
+from .utils import normalize_peek_limit
 
 # Type alias for the receive callback. 返回值可以是 None（同步订阅者）或 awaitable。
 OnReceiveCallback = Callable[[MailMessage], Any]
@@ -232,17 +234,51 @@ class MailboxProvider(ABC):
 
         return self._create_subscription_object(sub_id)
 
-    async def fetch(self, address: str, options: FetchOptions) -> Union[MailMessage, AckableMessage, None]:
+    async def fetch(self, address: str, options: Optional[FetchOptions] = None) -> Union[MailMessage, AckableMessage, List[MailMessage], None]:
         """
         Public fetch method. Delegates to _fetch.
+
+        `peek` 在基类里分流（不交给 `_fetch`）：只读快照走 `_peek`，不实现这个能力的 provider
+        直接报错——把 `peek` 当普通 fetch 跑就是把消息取走，而调用方以为自己在看一眼（issue#4）。
         """
+        options = options if options is not None else FetchOptions()
+        if options.peek:
+            return await self._peek_or_throw(address, options)
         return await self._fetch(address, options)
+
+    async def _peek_or_throw(self, address: str, options: FetchOptions) -> List[MailMessage]:
+        """只读快照入口：选项校验 + 能力检查，然后交给子类的 `_peek`。"""
+        if options.manual_ack:
+            raise InvalidFetchOptionsError(
+                "`FetchOptions(peek=True, manual_ack=True)` is contradictory: a peeked message is never "
+                "handed to a consumer, so there is nothing to acknowledge. Drop one of the two options."
+            )
+        if type(self)._peek is MailboxProvider._peek:
+            raise UnsupportedCapabilityError(
+                self.protocol,
+                "read-only peek (implement `_peek(address, limit=None)` on the provider, "
+                "or fetch without `peek`)",
+            )
+        return await self._peek(address, limit=normalize_peek_limit(options.limit))
 
     async def status(self, address: str) -> MailboxStatus:
         """
         Public status method. Delegates to _status or returns unknown.
         """
         return await self._status(address)
+
+    async def list_addresses(self) -> List[str]:
+        """
+        列出本 provider 当前认得的地址（canonical id，见
+        `utils.get_canonical_mailbox_address_identifier`）。可选能力。
+
+        只有消息确实存在本地的 provider（如 `MemoryProvider`）能实现。基类抛
+        `NotImplementedError`——`Mailbox.snapshot()` 会把这类 provider 归入
+        `MailboxSnapshot.unsupported_providers`，不会把「枚举不了」当成「队列为空」。
+        """
+        raise NotImplementedError(
+            f"The '{self.protocol}' provider cannot enumerate its addresses."
+        )
 
     async def ack(self, message: MailMessage) -> None:
         await self._ack(message)
@@ -271,14 +307,29 @@ class MailboxProvider(ABC):
 
     @abstractmethod
     async def _fetch(self, address: str, options: FetchOptions) -> Union[MailMessage, AckableMessage, None]:
+        """
+        Subclass responsibility: 真正的取信逻辑。
+        基类不会把 `peek=True` 送进这里（只读快照走 `_peek`），实现无需考虑只读分支。
+        """
         pass
+
+    async def _peek(self, address: str, limit: Optional[int] = None) -> List[MailMessage]:
+        """
+        Subclass responsibility (optional): 只读快照——返回队列头部消息的**副本**列表，
+        不出队、不建 in-flight、不改活动时间。不实现的 provider 在 `fetch(FetchOptions(peek=True))`
+        时会收到 `UnsupportedCapabilityError`，而不是被静默降级成普通 fetch。
+
+        :param limit: 已经过 `utils.normalize_peek_limit` 归一：`None` = 整个队列。
+        """
+        raise NotImplementedError  # pragma: no cover - 基类不会直接调到这里（见 _peek_or_throw）
 
     # --- Optional / Helper Methods ---
 
     async def _status(self, address: str) -> MailboxStatus:
         """
         Subclass responsibility (optional): Performs the actual status query logic.
-        未实现时返回 `unknown`，与 TS 端一致。
+        未实现时返回 `unknown`，与 TS 端一致。注意这里**不**设 `exists=False`：
+        问不到不等于不存在。
         """
         return MailboxStatus(
             state="unknown",

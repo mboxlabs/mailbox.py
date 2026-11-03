@@ -129,6 +129,17 @@ class MemoryEventBus:
         self.last_activity[topic] = datetime.now(timezone.utc).isoformat()
         self.queue.requeue(topic, message)
 
+    def peek(self, topic: str, limit: Optional[float] = None) -> List[MailMessage]:
+        """
+        【只读】取一份队列快照（副本），不出队、不建 in-flight、不刷活动时间。
+
+        :param topic: 要看的 topic。
+        :param limit: 最多看几条；省略 = 整个队列。
+        """
+        # 注意：这里**不**写 last_activity。只读诊断不该把一个空闲地址刷成“刚刚有活动”，
+        # 否则一个每隔几秒轮询一次的诊断页会让 last_activity_time 永远假绿。
+        return self.queue.peek(topic, limit)
+
     def clear(self, topic: Optional[str] = None) -> int:
         """
         丢弃队列里的消息（含 in-flight）并抹掉对应的活动时间；不传 `topic` 则清掉全部。
@@ -147,10 +158,32 @@ class MemoryEventBus:
             self.last_activity.pop(topic, None)
         return dropped
 
+    def knows(self, topic: str) -> bool:
+        """
+        这份总线认不认这个 topic：有过订阅、有过活动记录，或现在/曾有未结算的消息。
+
+        这是 `status().exists` 的依据。“地址不存在”与“地址空闲但确实存在”在诊断上是两件事
+        （issue#4）：前者 `exists=False` / `state='unknown'`，后者 `exists=True` / `state='online'`。
+        """
+        return (topic in self.topics) or (topic in self.last_activity) or self.queue.has_topic(topic)
+
+    def list_topics(self) -> List[str]:
+        """
+        这份总线上所有“认得”的 topic（订阅过 / 有过活动 / 有消息），按字典序排序。
+        供 `Mailbox.status()`（不传地址）做全量快照。
+        """
+        known = set(self.topics.keys()) | set(self.last_activity.keys()) | set(self.queue.topics())
+        return sorted(known)
+
     def get_status(self, topic: str) -> Dict[str, Any]:
+        """
+        :return: `exists` 区分“不存在”与“空闲”；`last_activity_time` 没活动记录时是 `None`
+            （不是“字段缺失”，否则 JSON 序列化后整个字段消失）。
+        """
         queue_status = self.queue.get_status(topic)
         subscriber_count = len(self.topics.get(topic, []))
         return {
+            'exists': self.knows(topic),
             'unread_count': queue_status['unread_count'],
             'in_flight_count': queue_status['in_flight_count'],
             'last_activity_time': self.last_activity.get(topic),
@@ -215,8 +248,9 @@ class MemoryProvider(MailboxProvider):
         if callable(unsubscribe_handle):
             unsubscribe_handle()
 
-    async def _fetch(self, address: str, options: FetchOptions) -> Union[MailMessage, AckableMessage, None]:
+    async def _fetch(self, address: str, options: Optional[FetchOptions] = None) -> Union[MailMessage, AckableMessage, None]:
         topic = get_canonical_mailbox_address_identifier(address)
+        options = options if options is not None else FetchOptions()
 
         if not options.manual_ack:
             return self.bus.fetch_and_forget(topic)
@@ -235,12 +269,41 @@ class MemoryProvider(MailboxProvider):
 
         return None
 
+    async def _peek(self, address: str, limit: Optional[float] = None) -> List[MailMessage]:
+        """
+        只读快照：副本，不动队列、不建 in-flight、不刷活动时间。
+
+        之前没有这个能力：想“看一眼”只能 `fetch(..., manual_ack=True)` 不 ack，消息就进了
+        in-flight（默认 30s 后重投），既干扰正常消费者的计数，也不是只读（issue#4）。
+        """
+        topic = get_canonical_mailbox_address_identifier(address)
+        return self.bus.peek(topic, limit)
+
+    async def list_addresses(self) -> List[str]:
+        """本总线认得的地址（canonical id）—— `mem:` 的消息就在本地，所以能枚举。"""
+        return self.bus.list_topics()
+
     async def _status(self, address: str) -> MailboxStatus:
         topic = get_canonical_mailbox_address_identifier(address)
         status_info = self.bus.get_status(topic)
 
+        if not status_info['exists']:
+            # 对“这个地址从不存在”回 `online` + 0，诊断页就分不出「不存在」和「空闲」（issue#4）。
+            return MailboxStatus(
+                state="unknown",
+                exists=False,
+                unread_count=status_info['unread_count'],
+                in_flight_count=status_info['in_flight_count'],
+                last_activity_time=status_info['last_activity_time'],
+                extra={
+                    'message': f"No queue, subscription or activity is known for '{topic}'.",
+                    'subscriber_count': status_info['subscriber_count'],
+                },
+            )
+
         return MailboxStatus(
             state="online",
+            exists=True,
             unread_count=status_info['unread_count'],
             in_flight_count=status_info['in_flight_count'],
             last_activity_time=status_info['last_activity_time'],

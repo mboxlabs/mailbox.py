@@ -3,6 +3,8 @@ from collections import deque
 from datetime import datetime, timedelta
 import time
 
+from ..utils import copy_for_peek, normalize_peek_limit
+
 T = TypeVar('T')
 
 # 手动 ACK 模式下未显式指定 ack_timeout 时使用的默认超时（秒）。
@@ -64,6 +66,53 @@ class MailMessageQueue(Generic[T]):
             flight = self.in_flight.pop(message_id)
             if requeue:
                 self.requeue_internal(flight.topic, flight.message, msg_id=message_id)
+
+    def peek(self, topic: str, limit: Optional[float] = None) -> List[T]:
+        """
+        【只读】看一眼队列头部最多 `limit` 条消息，**不**改动任何投递状态。
+
+        诊断 / 审计需要「看一眼但不消费」。在这之前最接近的做法是 `fetch(..., manual_ack=True)`
+        然后不 ack（issue#4）：那会把消息弄进 in-flight（默认 30s 后重投），既不是只读，
+        也会干扰正常消费者的 `unread_count` / `in_flight_count`。
+
+        保证：
+        - 不出队、不建 in-flight、不动 stale 扫描、不改任何时间戳；
+        - 返回副本（见 `utils.copy_for_peek`），调用方改不到队列里的对象；
+        - 只涵盖**等待中**的消息；in-flight（已被消费者取走、尚未 ack）不在快照里 ——
+          它属于那个消费者，只能在 `get_status()['in_flight_count']` 里看到。
+
+        :param topic: 要快照的 topic。
+        :param limit: 最多返回几条；省略则整个队列。必须是**非负整数**（或 `math.inf`）。
+        :return: 按 FIFO 顺序的消息副本列表；队列为空时是空列表（不是 `None`）。
+        :raises InvalidFetchOptionsError: `limit` 非法时抛出。
+        """
+        capped = normalize_peek_limit(limit)
+        queue = self.queues.get(topic)
+        if not queue:
+            return []
+        count = len(queue) if capped is None else min(capped, len(queue))
+        # 切片 + 副本：不取走、不反转、不重新排序
+        return [copy_for_peek(message) for message in list(queue)[:count]]
+
+    def has_topic(self, topic: str) -> bool:
+        """
+        这个 topic 在队列里有没有痕迹（等待中的消息或 in-flight）。
+        与 `has`（按消息 id）不同：这是按 topic 的「存不存在」，用于 status 的 `exists`。
+        """
+        queue = self.queues.get(topic)
+        if queue:
+            return True
+        return any(flight.topic == topic for flight in self.in_flight.values())
+
+    def topics(self) -> List[str]:
+        """当前有消息（等待中或 in-flight）的 topic 列表，按字典序排序（快照与测试断言需要确定性）。"""
+        known = set()
+        for topic, queue in self.queues.items():
+            if queue:
+                known.add(topic)
+        for flight in self.in_flight.values():
+            known.add(flight.topic)
+        return sorted(known)
 
     def get_status(self, topic: str) -> Dict[str, int]:
         """unread_count = 队列里等待的消息；in_flight_count = 已交给消费者、尚未 ack/nack。

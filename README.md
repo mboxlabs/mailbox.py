@@ -126,6 +126,16 @@ A mailbox address consists of three parts:
 - **`user@physical_address`**: The **globally unique, protocol-agnostic ID** of the logical mailbox or service. The same physical address can be accessed via different protocols (e.g., `mem:api@myservice.com` and `mailto:api@myservice.com` point to the same logical entity).
 - **`/logical_address`** (optional): An optional path for internal routing. For example, when combined with `tool-rpc`, it can route messages to specific tools within a larger service, allowing one physical address to serve as a unified gateway for multiple logical functions.
 
+**Query strings and fragments are not part of an address.** An address is normalized to
+`protocol://user@host/path` before it becomes a topic (the canonical id keeps the protocol so it can
+be parsed back — `get_canonical_mailbox_address_identifier()` is idempotent), so anything after `?`
+or `#` would be dropped silently: `mem:sales@example.com/inbox?thread=1` and
+`mem:sales@example.com/inbox` would end up sharing one queue and one delivery path, invisibly.
+Instead of merging two logical addresses, Mailbox rejects such addresses at every entry point
+(`post()`, `subscribe()`, `fetch()`, `status()`) with an `InvalidMailboxAddressError` — including the
+spellings with an empty `?` or `#`. Put what distinguishes the logical partitions in the path:
+`mem:sales@example.com/inbox/thread-1`. Percent-encoded `%3F` / `%23` are path content and stay legal.
+
 ## 🎯 Core Features
 
 There are two ways to receive mail, and one message goes to **one of them only**, decided
@@ -138,6 +148,10 @@ when `post()` runs:
 
 Mutually exclusive per message: a message already handed to a subscriber can never be
 fetched, and a queued message is never replayed to a subscriber that appears later.
+
+There are three verbs, three APIs — use these words consistently: `post()` writes, `subscribe()`
+registers a callback, `fetch()` asks for the next message itself. `fetch(addr,
+FetchOptions(peek=True))` is not a fourth way to receive: it receives nothing, it only looks.
 
 ### 1. Subscribe
 
@@ -218,18 +232,65 @@ if ackable:
 
 不传 ≠ 永不超时：否则崩溃的消费者会把消息永久卡在 in-flight。
 
+**Read-only peek:**
+```python
+pending = await mailbox.fetch("mem:service/inbox", FetchOptions(peek=True, limit=5))
+for msg in pending:
+    print(msg.body)   # 快照里的副本，改它改不到队列
+```
+
+`peek` returns **copies** of the queued messages as a list (`[]` when the queue is idle), and it
+changes nothing: `unread_count` and `in_flight_count` stay put, `last_activity_time` is not refreshed,
+and mutating what you got back cannot touch the queue. Before `peek` existed, the closest trick was
+`fetch(addr, FetchOptions(manual_ack=True))` without acking — that parks the message in-flight
+(requeued after the 30s ack timeout by default), which is not read-only and distorts what real
+consumers see. `peek` never lists messages another consumer is holding; those only show up as
+`in_flight_count`. Combining `peek` with `manual_ack` throws (`InvalidFetchOptionsError`), a bad
+`limit` (negative, fractional, `NaN`) throws too, and a provider that cannot do read-only snapshots
+raises `UnsupportedCapabilityError` rather than silently falling back to a consuming fetch.
+`limit=None` (or `math.inf`) means the whole queue.
+
 ### 3. Status Query
 
 ```python
 status = await mailbox.status("mem:service/inbox")
-print(f"State: {status.state}")
-print(f"Unread: {status.unread_count}")        # 仍在队列里等待
+print(f"State: {status.state}")            # 'online' | 'unknown' | 'degraded' | 'offline'
+print(f"Exists: {status.exists}")          # does the provider know this address at all?
+print(f"Unread: {status.unread_count}")    # 仍在队列里等待
 print(f"In flight: {status.in_flight_count}")  # 已取出、尚未 ack/nack
 print(f"Subscribers: {status.extra['subscriber_count']}")
+print(f"Last activity: {status.last_activity_time}")  # ISO 8601, or None
 ```
 
 `unread_count` 只统计队列里等待的消息；用 `manual_ack=True` 取出的消息单独计入
 `in_flight_count`，一直不 ack 会回到队列。
+
+`state` describes the provider's view **of that address**. An address the provider has never seen
+(never posted to, never subscribed, no recorded activity) reports `state="unknown"` and
+`exists=False` — reporting `online` + 0 for it would make a dashboard unable to tell "this address
+does not exist" from "this address is idle". A drained but real address stays `online`; so does an
+address that only has subscribers. `exists` is left `None` when the provider cannot answer status
+queries at all: "I cannot ask" is not "it does not exist". `last_activity_time` is `None` when there
+is no record — never a missing field, which would vanish entirely from `json.dumps`. Reading status
+never refreshes it.
+
+Diagnostics pages and tests usually want the whole picture at once. Call `status()` with no address
+(or `snapshot()`, same view) to get every topic of every registered provider:
+
+```python
+snap = await mailbox.status()
+print(snap.state)          # 'online' | 'degraded' | 'unknown'
+print(snap.address_count)  # topics known across the registered providers
+print(snap.unread_count, snap.in_flight_count)
+for entry in snap.addresses:
+    print(entry.canonical_id, entry.protocol, entry.state, entry.unread_count)
+```
+
+`addresses` is sorted by `canonical_id` so snapshots are reproducible, and each entry can be queried
+back with `mailbox.status(entry.canonical_id)`. Providers whose messages do not live locally
+(AMQP / SQS style brokers) cannot enumerate their topics; they are listed in
+`unsupported_providers` and the snapshot degrades to `state="degraded"` instead of pretending the
+queues are empty.
 
 ### 4. Accessing Providers
 
@@ -360,8 +421,9 @@ await mailbox.stop(purge=True)           # close subscriptions, then drop the ba
 provider.bus.clear("inbox@example.com")  # one topic only; returns how many messages were dropped
 ```
 
-The topic handed to `MemoryEventBus.clear()` is the canonical identifier (the address with its
-`mem:` scheme stripped off), because that is the key the bus files the queue under.
+The topic handed to `MemoryEventBus.clear()` is the canonical identifier
+(`protocol://user@host/path`, as produced by `get_canonical_mailbox_address_identifier()`), because
+that is the key the bus files the queue under.
 
 Caveats worth knowing:
 
@@ -426,11 +488,27 @@ class MyCustomProvider(MailboxProvider):
         pass
 
     async def _fetch(self, address: str, options: FetchOptions):
-        # Implement fetch logic
+        # Implement fetch logic. The base class never sends `peek=True` here: read-only
+        # snapshots go to `_peek`.
+        pass
+
+    async def _peek(self, address: str, limit=None) -> list:
+        # Optional: read-only snapshot — return copies of the queued messages (never dequeue,
+        # never build in-flight state, never bump activity). A provider that does not implement
+        # this raises UnsupportedCapabilityError on `fetch(FetchOptions(peek=True))` instead of
+        # silently consuming the messages. `limit` is already normalized: None = the whole queue.
         pass
 
     async def _status(self, address: str) -> MailboxStatus:
-        # Optional: status query logic. Not implementing it reports state='unknown'.
+        # Optional: status query logic. Not implementing it reports state='unknown' and leaves
+        # `exists` unset ("cannot ask" is not "does not exist"). An address this provider has
+        # never seen must report state='unknown' + exists=False, not 'online' + 0.
+        pass
+
+    async def list_addresses(self) -> list:
+        # Optional: canonical ids of the addresses this provider knows. Only providers whose
+        # messages live locally can implement it; the base class raises NotImplementedError and
+        # `Mailbox.snapshot()` files such providers under `unsupported_providers`.
         pass
 
     async def _nack(self, message: MailMessage, requeue: bool) -> None:
@@ -478,6 +556,12 @@ directly — that is where the delivery gets accounted for (implicit ack, retrie
   - Purgeable: `MailMessageQueue.clear()` / `MemoryEventBus.clear(topic=None)` / `MemoryProvider.clear()`
     / `Mailbox.clear()` / `Mailbox.stop(purge=True)` drop queued **and** in-flight messages and
     report how many were dropped; a late `ack()` / `nack(requeue)` on a dropped message is a no-op
+  - Read-only snapshot: `MemoryEventBus.peek(topic, limit=None)` / `MailMessageQueue.peek()` back
+    `fetch(addr, FetchOptions(peek=True))` — copies, no dequeue, no in-flight, no activity bump
+  - Honest status: `exists` tells "this address does not exist" from "idle", `last_activity_time`
+    is `None` rather than a missing field, and reading status or peeking never refreshes it
+  - Enumerable: `list_addresses()` / `MemoryEventBus.list_topics()` feed `Mailbox.snapshot()`;
+    `MailMessageQueue.has_topic()` / `topics()` back the `exists` decision
 
 ## 🧪 Testing
 
@@ -495,6 +579,20 @@ Tests include:
 - Fetch with manual-ack
 - Nack with requeue
 - Status queries, including in-flight visibility
+- Honest status (`issue#4`): an address the provider never saw reports `state="unknown"` +
+  `exists=False`; drained and subscriber-only addresses stay `online`; `last_activity_time` is
+  `None` (survives a JSON round trip); reading status never refreshes it; a provider that cannot
+  answer leaves `exists` unset
+- Snapshots: `status()` / `snapshot()` list every topic sorted by `canonical_id`, aggregate the
+  counts, and file providers that cannot enumerate their addresses under `unsupported_providers`
+  (snapshot degrades to `state="degraded"`)
+- Address rules (`issue#4`): query / hash (empty ones included) are rejected at `post()`,
+  `subscribe()`, `fetch()` and `status()` instead of silently merging two logical partitions into
+  one topic; opaque and hierarchical spellings of one address still land on the same topic;
+  canonical ids are idempotent and can be queried back
+- Read-only peek (`issue#4`): copies, no dequeue, no in-flight, no activity bump, `limit` bounds
+  and validation, `peek` + `manual_ack` rejected, a provider without `_peek` raises
+  `UnsupportedCapabilityError` instead of consuming the queue
 - Subscribe and fetch are mutually exclusive per message
 - Requeue deduplication and the retry policy helpers
 - Opt-in subscription retry: targeted redelivery, exhausted budget falls back to the queue
@@ -525,9 +623,9 @@ python/mboxlabs/mailbox/
 ├── message.py            # Message data structures
 ├── provider.py           # Abstract provider base class (delivery accounting, retry, barrier)
 ├── delivery.py           # DeliveryResult, delivery identity and the requeue decision
-├── error.py              # Exception definitions
+├── error.py              # Exception definitions (codes shared with the TS / Rust ports)
 ├── retry.py              # Retry policy, backoff and attempt accounting
-├── utils.py              # Utility functions
+├── utils.py              # Address parsing / canonical id / peek limit + copy helpers
 ├── providers/
 │   ├── memory.py         # In-memory provider
 │   └── queue.py          # Generic message queue
@@ -537,7 +635,10 @@ python/mboxlabs/mailbox/
     ├── test_delivery.py              # 投递记账工具
     ├── test_subscribe_partial_failure.py  # 部分失败不回队（issue#2）
     ├── test_delivery_settlement.py   # 结算竞态与兜底
-    └── test_memory_isolation.py      # 实例边界与状态清理（issue#3）
+    ├── test_memory_isolation.py      # 实例边界与状态清理（issue#3）
+    ├── test_address_canonicalization.py  # 地址不再被 query / hash 静默合并（issue#4）
+    ├── test_status_diagnostics.py    # status 的 exists / 全量快照（issue#4）
+    └── test_peek.py                  # 只读快照（issue#4）
 ```
 
 ## 🔧 Dependencies

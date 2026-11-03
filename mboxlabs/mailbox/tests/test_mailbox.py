@@ -154,11 +154,22 @@ class TestMailbox(unittest.IsolatedAsyncioTestCase):
             body="content"
         )
 
+        # 1. Initial status —— 这个地址还没人碰过：不是「在线且空闲」，是「provider 认不得它」（issue#4）
+        initial = await self.mailbox.status(address)
+        self.assertEqual(initial.state, "unknown")
+        self.assertIs(initial.exists, False)
+        self.assertEqual(initial.unread_count, 0)
+        self.assertEqual(initial.extra["subscriber_count"], 0)
+        self.assertIsNone(initial.last_activity_time)
+
+        # 2. Post a message and check status
         await self.mailbox.post(mail)
 
         status = await self.mailbox.status(address)
         self.assertEqual(status.unread_count, 1)
         self.assertEqual(status.state, "online")
+        self.assertIs(status.exists, True)
+        self.assertIsInstance(status.last_activity_time, str)
 
     def test_provider_access(self):
         # Test providers property

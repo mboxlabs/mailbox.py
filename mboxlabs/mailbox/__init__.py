@@ -1,7 +1,29 @@
 from .core import Mailbox
-from .message import OutgoingMail, MailMessage, MailboxStatus, FetchOptions
+from .message import (
+    OutgoingMail,
+    MailMessage,
+    MailboxStatus,
+    MailboxAddressSnapshot,
+    MailboxSnapshot,
+    FetchOptions,
+)
 from .provider import MailboxProvider, Subscription, AckableMessage
-from .error import MailboxError, ProviderNotFound, InvalidAddress
+from .error import (
+    MailboxError,
+    ProviderNotFound,
+    NoProviderError,
+    InvalidAddress,
+    InvalidMailboxAddressError,
+    InvalidFetchOptionsError,
+    UnsupportedCapabilityError,
+)
+from .utils import (
+    assert_lossless_mailbox_address,
+    copy_for_peek,
+    get_canonical_mailbox_address_identifier,
+    normalize_peek_limit,
+    parse_mailbox_address,
+)
 from .providers.memory import DEFAULT_MEMORY_SCOPE, MemoryEventBus, MemoryProvider
 from .providers.queue import DEFAULT_ACK_TIMEOUT, MailMessageQueue
 from .delivery import (
@@ -40,13 +62,24 @@ __all__ = [
     'OutgoingMail',
     'MailMessage',
     'MailboxStatus',
+    'MailboxAddressSnapshot',
+    'MailboxSnapshot',
     'FetchOptions',
     'MailboxProvider',
     'Subscription',
     'AckableMessage',
     'MailboxError',
     'ProviderNotFound',
+    'NoProviderError',
     'InvalidAddress',
+    'InvalidMailboxAddressError',
+    'InvalidFetchOptionsError',
+    'UnsupportedCapabilityError',
+    'assert_lossless_mailbox_address',
+    'copy_for_peek',
+    'get_canonical_mailbox_address_identifier',
+    'normalize_peek_limit',
+    'parse_mailbox_address',
     'MailMessageQueue',
     'MemoryEventBus',
     'MemoryProvider',

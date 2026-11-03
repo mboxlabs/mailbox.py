@@ -1,11 +1,19 @@
-from typing import Dict, Optional, Union
-from urllib.parse import urlparse
+from typing import Dict, List, Optional, Union
 import asyncio
+from datetime import datetime, timezone
 import weakref
 
-from .message import OutgoingMail, MailMessage, MailboxStatus, FetchOptions
+from .message import (
+    OutgoingMail,
+    MailMessage,
+    MailboxAddressSnapshot,
+    MailboxSnapshot,
+    MailboxStatus,
+    FetchOptions,
+)
 from .provider import MailboxProvider, Subscription, AckableMessage
 from .error import ProviderNotFound
+from .utils import parse_mailbox_address
 
 
 class _ProviderOwnerMark:
@@ -93,7 +101,8 @@ class Mailbox:
         self._providers[provider.protocol] = provider
 
     async def post(self, mail: OutgoingMail) -> MailMessage:
-        parsed_to = urlparse(mail.to)
+        parsed_to = parse_mailbox_address(mail.to, "post()")
+        parse_mailbox_address(mail.from_, "post() (from)")  # 两端规则要一致
         provider = self.get_provider(parsed_to.scheme, raise_error_if_failed=True)
 
         message_id = mail.id if mail.id else provider.generate_id()
@@ -103,19 +112,115 @@ class Mailbox:
         return await provider.send(message)
 
     async def subscribe(self, address: str, on_receive: callable) -> Subscription:
-        parsed_address = urlparse(address)
+        parsed_address = parse_mailbox_address(address, "subscribe()")
         provider = self.get_provider(parsed_address.scheme, raise_error_if_failed=True)
         return await provider.subscribe(address, on_receive)
 
-    async def fetch(self, address: str, options: FetchOptions) -> Union[MailMessage, AckableMessage, None]:
-        parsed_address = urlparse(address)
+    async def fetch(self, address: str, options: Optional[FetchOptions] = None) -> Union[
+        MailMessage, AckableMessage, List[MailMessage], None
+    ]:
+        """
+        取信 / 只读快照。
+
+        - 默认（不传 `options`）：取一封，隐式 ACK（出队即完成）。
+        - `FetchOptions(manual_ack=True)`：取一封，进 in-flight，直到 ack / nack 或超时重投。
+        - `FetchOptions(peek=True, limit=n)`：**只读**——返回副本列表（空队列是 `[]`），不出队、
+          不建 in-flight、不刷活动时间。诊断与测试断言用这个，不要用「manual_ack 但不 ack」凑。
+
+        `peek` 与 `manual_ack` 同时给出会直接报错（互相矛盾），provider 不支持只读时抛
+        `UnsupportedCapabilityError`——都不会被静默降级成普通取信。
+        """
+        parsed_address = parse_mailbox_address(address, "fetch()")
         provider = self.get_provider(parsed_address.scheme, raise_error_if_failed=True)
         return await provider.fetch(address, options)
 
-    async def status(self, address: str) -> MailboxStatus:
-        parsed_address = urlparse(address)
+    async def status(self, address: Optional[str] = None) -> Union[MailboxStatus, MailboxSnapshot]:
+        """
+        查询指定地址的状态信息；**不传地址 = 全量快照**（见 `snapshot()`）。
+
+        地址在 provider 里没有任何记录（没投过、没订阅过、没有活动）时，返回
+        `state='unknown'` + `exists=False`，而不是 `state='online'` + 0——诊断页要能区分
+        “这个地址不存在”和“这个地址空闲”。
+
+        :param address: 要查询的地址；`None` 时返回全量快照。
+        """
+        if address is None:
+            return await self.snapshot()
+
+        parsed_address = parse_mailbox_address(address, "status()")
         provider = self.get_provider(parsed_address.scheme, raise_error_if_failed=True)
+
         return await provider.status(address)
+
+    async def snapshot(self) -> MailboxSnapshot:
+        """
+        全量快照：把所有能枚举自身地址的 provider 的 topic 状态汇成一个可断言的结构。
+
+        等价于不传地址的 `status()`，只是名字更直白（诊断页里 `mailbox.snapshot()` 比
+        `mailbox.status()` 更好读）。不能枚举的 provider（消息不在本地，如 AMQP / SQS）会列在
+        `unsupported_providers` 里，不会被误报成“队列为空”。
+        """
+        protocols = sorted(self._providers.keys())
+        addresses: List[MailboxAddressSnapshot] = []
+        unsupported_providers: List[str] = []
+
+        for protocol, provider in self._providers.items():
+            try:
+                canonical_ids = await provider.list_addresses()
+            except NotImplementedError:
+                unsupported_providers.append(protocol)
+                continue
+
+            for canonical_id in canonical_ids:
+                addresses.append(
+                    MailboxAddressSnapshot.from_status(
+                        canonical_id, protocol, await _status_of_canonical_address(provider, canonical_id)
+                    )
+                )
+
+        addresses.sort(key=lambda entry: entry.canonical_id)
+
+        unread_count = sum(entry.unread_count or 0 for entry in addresses)
+        in_flight_count = sum(entry.in_flight_count or 0 for entry in addresses)
+        enumerated = len(protocols) - len(unsupported_providers)
+
+        if enumerated == 0:
+            state = "unknown"  # 没有任何 provider 能枚举：这份快照什么都没说
+        elif unsupported_providers or any(entry.state != "online" for entry in addresses):
+            state = "degraded"  # 只看到一部分，或有地址本身就不在线
+        else:
+            state = "online"
+
+        return MailboxSnapshot(
+            state=state,
+            protocols=protocols,
+            address_count=len(addresses),
+            unread_count=unread_count,
+            in_flight_count=in_flight_count,
+            addresses=addresses,
+            unsupported_providers=sorted(unsupported_providers),
+            taken_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+
+async def _status_of_canonical_address(provider: MailboxProvider, canonical_id: str) -> MailboxStatus:
+    """
+    快照里对单个地址的查询：canonical id 本身可以重新解析成地址（它已经是
+    `protocol://user@host/path` 形式）。解析不了是 provider 的 bug，宁可报 unknown
+    也不能让整个快照崩掉。
+    """
+    try:
+        return await provider.status(canonical_id)
+    except Exception as error:  # pragma: no cover - provider 自己报的 id 又查不回来
+        return MailboxStatus(
+            state="unknown",
+            exists=True,
+            extra={
+                "message": f"The '{provider.protocol}' provider listed '{canonical_id}', "
+                           "but it could not be queried back.",
+                "cause": str(error),
+            },
+        )
 
 
 def _mark_provider_ownership(mailbox: "Mailbox", provider: MailboxProvider) -> None:
